@@ -248,7 +248,10 @@ e.g. elisp forms may be printed via `prin1'."
                          (:copier nil)
                          (:named))
   "Queue to hold elpacas."
-  (type (unless after-init-time 'init))
+  (type (when (or (not after-init-time)
+                  (let ((init (expand-file-name "init.el" user-emacs-directory)))
+                    (member init (list load-true-file-name (buffer-file-name)))))
+          'init))
   (id  (if (boundp 'elpaca--queues) (length elpaca--queues) 0))
   (processed 0)
   (status 'incomplete)
@@ -673,8 +676,9 @@ Optional ARGS are passed to `elpaca--signal', which see."
              (status (car log))
              (info (nth 2 log))
              (q (or queue (car elpaca--queues))))
-        (when queue (setf (elpaca<-queue-id e) (elpaca-q<-id q)))
-        (push (cons (elpaca<-id e) e) (elpaca-q<-elpacas q))
+        (when queue (setf (elpaca<-queue-id e) (elpaca-q<-id q)
+                          (elpaca<-init e) (elpaca-q<-type q)))
+        (setf (alist-get (elpaca<-id e) (elpaca-q<-elpacas q)) e)
         (if (eq status 'struct-failed)
             (elpaca--fail e info)
           (elpaca--signal e info status nil 1))
@@ -1438,12 +1442,21 @@ When MESSAGE is non-nil, message the list of dependents."
 (defmacro elpaca (order &rest body)
   "Install ORDER, then execute BODY.
 If ORDER is `nil`, defer BODY until orders have been processed."
-  (declare (indent 1))
-  (unless (or (null order) (memq (car-safe order) '(\` quote))) (setq order `(quote ,order)))
-  (let ((exps (delq nil (list (and body `(push ',(cons (elpaca--first (cadr order)) body)
-                                               (elpaca-q<-forms (car elpaca--queues))))
-                              (and order `(elpaca--queue ,order))))))
-    (if (cdr exps) `(progn ,@exps) (car exps))))
+  (declare (indent 1) (debug t))
+  (when (eq (car-safe order) '\`) (setq order (eval order t)))
+  (unless (or (eq (car-safe order) 'quote) (null order)) (setq order `(quote ,order)))
+  (let ((item (elpaca--first (cadr order))))
+    `(let ((q (or ,@(when item `((and after-init-time (elpaca--q (elpaca-get ',item)))))
+                  (car elpaca--queues))))
+       ,@(when body (if item
+                        `((setf (alist-get ',item (elpaca-q<-forms q)) ',body))
+                      ;;@FIX: nil semantics not good for multiple deferred...
+                      `((push (cons ',item . ',body)) (elpaca-q<-forms q))))
+       ,@(when order `((elpaca--queue ,order q)))
+       (when (and after-init-time (eq this-command 'eval-last-sexp))
+         (elpaca--maybe-log t)
+         (elpaca-process-queues))
+       nil)))
 
 (defcustom elpaca-wait-interval 0.01 "Seconds between `elpaca-wait' status checks."
   :type 'number)
@@ -1523,6 +1536,15 @@ When INTERACTIVE is non-nil, immediately process ORDER, otherwise queue ORDER."
    ((and (not (elpaca-q<-elpacas q)) (elpaca-q<-forms q)) (elpaca--finalize-queue q))
    (t (mapc #'elpaca--process (reverse (mapcar #'cdr (elpaca-q<-elpacas q)))))))
 
+(defun elpaca--maybe-reset-queue (q)
+  "Reset Q containing incomplete orders."
+  (let* ((elpacas (elpaca-q<-elpacas q))
+         (processed (cl-count 'finished elpacas
+                              :key (lambda (qd) (elpaca--status (cdr qd))))))
+    (setf (elpaca-q<-processed q) processed
+          (elpaca-q<-status q) (if (and (> processed 0) (= processed (length elpacas)))
+                                   'complete 'incomplete))))
+
 ;;;###autoload
 (defun elpaca-process-queues (&optional filter)
   "Process the incomplete queues.
@@ -1530,6 +1552,7 @@ FILTER must be a unary function which accepts and returns a queue list."
   (when (and after-init-time elpaca--debug-init) (setq debug-on-error t elpaca--debug-init nil))
   (if-let ((queues (if filter (funcall filter (reverse elpaca--queues))
                      (reverse elpaca--queues)))
+           ((mapc #'elpaca--maybe-reset-queue queues))
            (incomplete (cl-find 'incomplete queues :key #'elpaca-q<-status)))
       (progn (setq elpaca--status-counts (elpaca--count-statuses))
              (elpaca--process-queue incomplete))
@@ -1608,26 +1631,30 @@ If PROMPT is non-nil, it is used instead of the default."
     (setf (elpaca-q<-status q) 'incomplete)))
 
 ;;;###autoload
-(defun elpaca-rebuild (item &optional interactive)
+(defun elpaca-rebuild (item &optional scratch interactive)
   "Rebuild ITEM's associated package.
+When SCRATCH is non-nil, use all build-steps.
 When INTERACTIVE is non-nil, prompt for ITEM, immediately process.
 With a prefix argument, rebuild current file's package or prompt if none found."
   (interactive (list (or (and-let* ((current-prefix-arg)
                                     (queued (elpaca--file-package))
                                     ((car queued))))
                          (elpaca--read-queued "Rebuild package: "))
+                     nil
                      t))
   (let ((e (or (elpaca-get item) (user-error "Package %S is not queued" item))))
-    (when (eq (elpaca--status e) 'finished)
-      ;;@MAYBE: remove Info/load-path entries?
-      (setf (elpaca<-build-steps e)
-            (cl-set-difference (elpaca--build-steps (elpaca<-recipe e))
-                               '(elpaca--clone
-                                 elpaca--configure-remotes
-                                 elpaca--fetch
-                                 elpaca--checkout-ref
-                                 elpaca--clone-dependencies
-                                 elpaca--activate-package))))
+    (if scratch
+        (setf (elpaca<-build-steps e) (elpaca--build-steps (elpaca<-recipe e)))
+      (when (eq (elpaca--status e) 'finished)
+        ;;@MAYBE: remove Info/load-path entries?
+        (setf (elpaca<-build-steps e)
+              (cl-set-difference (elpaca--build-steps (elpaca<-recipe e))
+                                 '(elpaca--clone
+                                   elpaca--configure-remotes
+                                   elpaca--fetch
+                                   elpaca--checkout-ref
+                                   elpaca--clone-dependencies
+                                   elpaca--activate-package)))))
     (elpaca--unprocess e)
     (elpaca--signal e "Rebuilding" 'queued)
     (setf elpaca-cache-autoloads nil (elpaca<-files e) nil)
